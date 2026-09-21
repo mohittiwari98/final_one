@@ -13,6 +13,19 @@ const questionSchema = new mongoose.Schema({
   correctOption: { type: Number, required: true, min: 0, max: 3 },
   marks: { type: Number, required: true, default: 1, min: 0 },
   negativeMarks: { type: Number, required: true, default: 0, min: 0 },
+  // Optional per-question time limit, in SECONDS. Leave unset to inherit
+  // from the phase or the quiz (see the timer precedence rule below).
+  duration: { type: Number, min: 1, default: null },
+  // Optional index into quiz.phases, so this question can inherit a
+  // phase-level duration instead of falling straight back to the quiz default.
+  phaseIndex: { type: Number, default: null },
+});
+
+// A phase is just a named group of questions that can share one duration.
+// Phases are entirely optional — a quiz with no phases behaves exactly like before.
+const phaseSchema = new mongoose.Schema({
+  title: { type: String, required: true, trim: true },
+  duration: { type: Number, min: 1, default: null }, // minutes
 });
 
 const quizSchema = new mongoose.Schema(
@@ -27,7 +40,8 @@ const quizSchema = new mongoose.Schema(
     },
     startTime: { type: Date, required: true },
     endTime: { type: Date, required: true },
-    duration: { type: Number, required: true, min: 1 }, // minutes
+    duration: { type: Number, required: true, min: 1 }, // minutes — the quiz-level fallback
+    phases: { type: [phaseSchema], default: [] },
     questions: {
       type: [questionSchema],
       required: true,
