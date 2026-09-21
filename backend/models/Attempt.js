@@ -20,6 +20,12 @@ const attemptSchema = new mongoose.Schema(
     totalMarks: { type: Number, default: 0 },
     percentage: { type: Number, default: 0 },
     timeTakenSeconds: { type: Number, default: 0 },
+    // Where the student currently is, and when the clock for that
+    // question/phase started ticking. This is what makes per-question and
+    // per-phase timers possible instead of one deadline for the whole quiz.
+    currentQuestionIndex: { type: Number, default: 0 },
+    itemStartedAt: { type: Date },
+    phaseStartedAt: { type: Date },
   },
   { timestamps: true }
 );
