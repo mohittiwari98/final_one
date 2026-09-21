@@ -1,9 +1,16 @@
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useCallback, useRef, useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import api from '../api/axios';
 import Countdown from '../components/Countdown';
 
 const letters = ['A', 'B', 'C', 'D'];
+
+const sourceLabel = {
+  QUESTION: 'Question timer',
+  PHASE: 'Phase timer',
+  QUIZ: 'Quiz timer',
+  NONE: 'Untimed',
+};
 
 const styles = `
   .qz-take {
@@ -62,14 +69,27 @@ const styles = `
     transition: width 0.2s ease;
   }
 
-  .qz-countdown-chip {
+  .qz-countdown-wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.3rem;
     flex-shrink: 0;
+  }
+  .qz-countdown-source {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--steel);
+  }
+  .qz-countdown-none {
     background: var(--paper-raised);
     border: 1px solid var(--line);
     border-radius: 3px;
     padding: 0.5rem 0.9rem;
-    font-variant-numeric: tabular-nums;
-    font-size: 0.95rem;
+    font-size: 0.85rem;
+    color: var(--steel);
   }
 
   .qz-error {
@@ -84,7 +104,6 @@ const styles = `
     border-radius: 4px;
     padding: 1.5rem;
   }
-  .qz-question-card + .qz-question-card { margin-top: 1rem; }
 
   .qz-question-top {
     display: flex;
@@ -93,7 +112,7 @@ const styles = `
     gap: 1rem;
   }
   .qz-question-text {
-    font-size: 1.02rem;
+    font-size: 1.05rem;
     line-height: 1.5;
     margin: 0;
     max-width: 82%;
@@ -160,6 +179,8 @@ const styles = `
     margin: 2.25rem 0 1.5rem;
   }
 
+  .qz-nav-row { display: flex; justify-content: flex-end; gap: 0.75rem; }
+
   .qz-submit {
     font-family: inherit;
     font-size: 1rem;
@@ -196,12 +217,13 @@ const TakeQuiz = () => {
   const { quizId } = useParams();
   const navigate = useNavigate();
 
-  const [session, setSession] = useState(null); // { attemptId, deadline, quiz }
-  const [answers, setAnswers] = useState({}); // questionIndex -> selectedOption
+  // session: { attemptId, quiz, currentQuestionIndex, deadline, source }
+  const [session, setSession] = useState(null);
+  const [answers, setAnswers] = useState({}); // absolute questionIndex -> selectedOption
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(true);
-  const [submitting, setSubmitting] = useState(false);
-  const submittedRef = useRef(false);
+  const [busy, setBusy] = useState(false); // true while advancing or submitting
+  const finishingRef = useRef(false);
 
   useEffect(() => {
     api
@@ -211,12 +233,14 @@ const TakeQuiz = () => {
       .finally(() => setLoading(false));
   }, [quizId]);
 
-  const select = (qIdx, optIdx) => setAnswers((a) => ({ ...a, [qIdx]: optIdx }));
+  const select = (optIdx) => {
+    setAnswers((a) => ({ ...a, [session.currentQuestionIndex]: optIdx }));
+  };
 
   const submit = useCallback(async () => {
-    if (submittedRef.current || !session) return;
-    submittedRef.current = true;
-    setSubmitting(true);
+    if (finishingRef.current || !session) return;
+    finishingRef.current = true;
+    setBusy(true);
     try {
       const payload = {
         answers: Object.entries(answers).map(([questionIndex, selectedOption]) => ({
@@ -228,10 +252,37 @@ const TakeQuiz = () => {
       navigate(`/student/quizzes/${quizId}/result`);
     } catch (err) {
       setError(err.response?.data?.message || 'Could not submit your attempt');
-      submittedRef.current = false;
-      setSubmitting(false);
+      finishingRef.current = false;
+      setBusy(false);
     }
   }, [answers, session, quizId, navigate]);
+
+  // Called both when the timer for the current question/phase runs out,
+  // and when the student manually taps "Next".
+  const advance = useCallback(async () => {
+    if (finishingRef.current || !session || busy) return;
+    setBusy(true);
+    try {
+      const selectedOption = answers[session.currentQuestionIndex];
+      const { data } = await api.post(`/attempts/${session.attemptId}/advance`, {
+        selectedOption: typeof selectedOption === 'number' ? selectedOption : undefined,
+      });
+      if (data.finished) {
+        await submit();
+        return;
+      }
+      setSession((s) => ({
+        ...s,
+        currentQuestionIndex: data.currentQuestionIndex,
+        deadline: data.deadline,
+        source: data.source,
+      }));
+      setBusy(false);
+    } catch (err) {
+      setError(err.response?.data?.message || 'Could not move to the next question');
+      setBusy(false);
+    }
+  }, [session, answers, busy, submit]);
 
   if (loading)
     return (
@@ -253,9 +304,11 @@ const TakeQuiz = () => {
     );
   }
 
-  const { quiz, deadline } = session;
+  const { quiz, currentQuestionIndex, deadline, source } = session;
+  const q = quiz.questions[currentQuestionIndex];
+  const isLast = currentQuestionIndex === quiz.questions.length - 1;
   const answeredCount = Object.keys(answers).length;
-  const progressPct = Math.round((answeredCount / quiz.questions.length) * 100);
+  const progressPct = Math.round(((currentQuestionIndex + 1) / quiz.questions.length) * 100);
 
   return (
     <div className="qz-take">
@@ -269,52 +322,62 @@ const TakeQuiz = () => {
         <div style={{ flex: 1, minWidth: 220 }}>
           <h1 className="qz-take-title">{quiz.title}</h1>
           <p className="qz-take-progress-label">
-            {answeredCount} of {quiz.questions.length} answered
+            Question {currentQuestionIndex + 1} of {quiz.questions.length} · {answeredCount} answered
           </p>
           <div className="qz-take-progress-bar">
             <div className="qz-take-progress-fill" style={{ width: `${progressPct}%` }} />
           </div>
         </div>
-        <div className="qz-countdown-chip">
-          <Countdown target={deadline} onExpire={submit} />
+        <div className="qz-countdown-wrap">
+          <span className="qz-countdown-source">{sourceLabel[source]}</span>
+          {deadline ? (
+            <Countdown target={deadline} onExpire={advance} size="sm" />
+          ) : (
+            <span className="qz-countdown-none">No time limit</span>
+          )}
         </div>
       </div>
 
       {error && <p className="qz-error">{error}</p>}
 
-      <div>
-        {quiz.questions.map((q, qIdx) => (
-          <div key={qIdx} className="qz-question-card">
-            <div className="qz-question-top">
-              <p className="qz-question-text">{qIdx + 1}. {q.questionText}</p>
-              <span className="qz-marks-tag">
-                +{q.marks}{q.negativeMarks > 0 ? ` / -${q.negativeMarks}` : ''}
-              </span>
-            </div>
-            <div className="qz-options">
-              {q.options.map((opt, optIdx) => (
-                <button
-                  key={optIdx}
-                  type="button"
-                  className={`qz-option-btn ${answers[qIdx] === optIdx ? 'selected' : ''}`}
-                  onClick={() => select(qIdx, optIdx)}
-                >
-                  <span className="qz-option-letter">{letters[optIdx]}</span>
-                  <span>{opt}</span>
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
+      <div className="qz-question-card">
+        <div className="qz-question-top">
+          <p className="qz-question-text">{currentQuestionIndex + 1}. {q.questionText}</p>
+          <span className="qz-marks-tag">
+            +{q.marks}{q.negativeMarks > 0 ? ` / -${q.negativeMarks}` : ''}
+          </span>
+        </div>
+        <div className="qz-options">
+          {q.options.map((opt, optIdx) => (
+            <button
+              key={optIdx}
+              type="button"
+              className={`qz-option-btn ${answers[currentQuestionIndex] === optIdx ? 'selected' : ''}`}
+              onClick={() => select(optIdx)}
+              disabled={busy}
+            >
+              <span className="qz-option-letter">{letters[optIdx]}</span>
+              <span>{opt}</span>
+            </button>
+          ))}
+        </div>
       </div>
 
       <hr className="qz-take-divider" />
 
-      <button className="qz-submit" onClick={submit} disabled={submitting}>
-        {submitting ? 'Submitting…' : 'Submit quiz'}
-      </button>
+      <div className="qz-nav-row">
+        {isLast ? (
+          <button className="qz-submit" onClick={submit} disabled={busy}>
+            {busy ? 'Submitting…' : 'Submit quiz'}
+          </button>
+        ) : (
+          <button className="qz-submit" onClick={advance} disabled={busy}>
+            {busy ? 'Please wait…' : 'Next question'}
+          </button>
+        )}
+      </div>
       <p className="qz-submit-note">
-        You can only attempt this quiz once. It will submit automatically when the timer runs out.
+        You can only attempt this quiz once. It will move on automatically when the timer runs out.
       </p>
     </div>
   );
