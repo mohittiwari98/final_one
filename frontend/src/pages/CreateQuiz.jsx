@@ -13,6 +13,8 @@ const emptyQuestion = () => ({
   correctOption: 0,
   marks: 1,
   negativeMarks: 0,
+  duration: '',   // optional, in seconds. Leave blank to inherit from phase/quiz.
+  phaseIndex: '', // optional. '' means "no phase / inherit quiz default".
 });
 
 const fmt = (v) => (v ? new Date(v).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '—');
@@ -436,6 +438,7 @@ const CreateQuiz = () => {
     duration: 30,
   });
   const [questions, setQuestions] = useState([emptyQuestion()]);
+  const [phases, setPhases] = useState([]); // [{ title, duration }]
   const [activeQuestion, setActiveQuestion] = useState(0);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -471,6 +474,28 @@ const CreateQuiz = () => {
   const removeQuestion = (idx) => {
     setQuestions((qs) => qs.filter((_, i) => i !== idx));
     setActiveQuestion((a) => Math.max(0, a >= idx ? a - 1 : a));
+  };
+
+  const addPhase = () => {
+    setPhases((ps) => [...ps, { title: `Phase ${ps.length + 1}`, duration: '' }]);
+  };
+
+  const updatePhase = (idx, patch) => {
+    setPhases((ps) => ps.map((p, i) => (i === idx ? { ...p, ...patch } : p)));
+  };
+
+  const removePhase = (idx) => {
+    setPhases((ps) => ps.filter((_, i) => i !== idx));
+    // Any question that pointed at this phase, or a later one, needs re-pointing.
+    setQuestions((qs) =>
+      qs.map((q) => {
+        if (q.phaseIndex === '') return q;
+        const pIdx = Number(q.phaseIndex);
+        if (pIdx === idx) return { ...q, phaseIndex: '' };
+        if (pIdx > idx) return { ...q, phaseIndex: String(pIdx - 1) };
+        return q;
+      })
+    );
   };
 
   const isQuestionComplete = (q) => q.questionText.trim() && q.options.every((o) => o.trim());
@@ -522,11 +547,17 @@ const CreateQuiz = () => {
       const payload = {
         ...meta,
         duration: Number(meta.duration),
+        phases: phases.map((p) => ({
+          title: p.title,
+          duration: p.duration ? Number(p.duration) : null,
+        })),
         questions: questions.map((q) => ({
           ...q,
           marks: Number(q.marks),
           negativeMarks: Number(q.negativeMarks),
           correctOption: Number(q.correctOption),
+          duration: q.duration ? Number(q.duration) : null,
+          phaseIndex: q.phaseIndex === '' ? null : Number(q.phaseIndex),
         })),
       };
       const { data } = await api.post('/quizzes', payload);
@@ -607,6 +638,41 @@ const CreateQuiz = () => {
 
           {step === 1 && (
             <div>
+              <div className="qz-panel">
+                <div className="qz-panel-head">
+                  <h3>Phases (optional)</h3>
+                  <button type="button" className="qz-icon-btn" onClick={addPhase} title="Add phase">
+                    <Plus size={16} />
+                  </button>
+                </div>
+                {phases.length === 0 && (
+                  <p className="qz-review-meta">
+                    No phases yet — questions will just use the quiz's overall duration unless you set one below.
+                  </p>
+                )}
+                {phases.map((p, idx) => (
+                  <div key={idx} className="qz-field-row" style={{ marginTop: idx === 0 ? 0 : '1.15rem', alignItems: 'end' }}>
+                    <div className="qz-field">
+                      <label>Phase name</label>
+                      <input value={p.title} onChange={(e) => updatePhase(idx, { title: e.target.value })} />
+                    </div>
+                    <div className="qz-field">
+                      <label>Duration for this phase (minutes, optional)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={p.duration}
+                        onChange={(e) => updatePhase(idx, { duration: e.target.value })}
+                        placeholder="Inherits quiz duration"
+                      />
+                    </div>
+                    <button type="button" className="qz-icon-btn" onClick={() => removePhase(idx)} title="Remove phase">
+                      <Trash2 size={16} />
+                    </button>
+                  </div>
+                ))}
+              </div>
+
               <div className="qz-qtabs">
                 {questions.map((q, idx) => (
                   <button
@@ -692,6 +758,33 @@ const CreateQuiz = () => {
                       />
                     </div>
                   </div>
+
+                  <div className="qz-field-row">
+                    <div className="qz-field">
+                      <label>Phase (optional)</label>
+                      <div className="qz-select-wrap">
+                        <select
+                          value={questions[activeQuestion].phaseIndex}
+                          onChange={(e) => updateQuestion(activeQuestion, { phaseIndex: e.target.value })}
+                        >
+                          <option value="">No phase</option>
+                          {phases.map((p, idx) => (
+                            <option key={idx} value={idx}>{p.title || `Phase ${idx + 1}`}</option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                    <div className="qz-field">
+                      <label>This question's own time limit (seconds, optional)</label>
+                      <input
+                        type="number"
+                        min={1}
+                        value={questions[activeQuestion].duration}
+                        onChange={(e) => updateQuestion(activeQuestion, { duration: e.target.value })}
+                        placeholder="Inherits phase / quiz duration"
+                      />
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -721,6 +814,13 @@ const CreateQuiz = () => {
                     <h3 style={{ maxWidth: '85%' }}>{idx + 1}. {q.questionText}</h3>
                     <span className="qz-marks-tag">+{q.marks}{q.negativeMarks > 0 ? ` / -${q.negativeMarks}` : ''}</span>
                   </div>
+                  <p className="qz-review-meta" style={{ marginTop: '0.3rem' }}>
+                    {q.duration
+                      ? `Timed: ${q.duration}s for this question`
+                      : q.phaseIndex !== '' && phases[Number(q.phaseIndex)]
+                      ? `Timed: shares "${phases[Number(q.phaseIndex)].title}" phase timer`
+                      : "Uses the quiz's overall timer"}
+                  </p>
                   <div className="qz-options">
                     {q.options.map((opt, optIdx) => (
                       <div key={optIdx} className={`qz-review-option ${Number(q.correctOption) === optIdx ? 'correct' : ''}`}>
