@@ -546,6 +546,8 @@ const CreateQuiz = () => {
     try {
       const payload = {
         ...meta,
+        startTime: new Date(meta.startTime).toISOString(),
+        endTime: new Date(meta.endTime).toISOString(),
         duration: Number(meta.duration),
         phases: phases.map((p) => ({
           title: p.title,
