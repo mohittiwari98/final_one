@@ -1,6 +1,7 @@
 const Quiz = require('../models/Quiz');
 const Attempt = require('../models/Attempt');
 const Student = require('../models/Student');
+const { resolveCurrentDeadline } = require('../utils/timerResolver');
 
 const GRACE_MS = 5000; // small network-latency buffer
 
@@ -73,7 +74,15 @@ const startAttempt = async (req, res, next) => {
 
     if (!attempt) {
       try {
-        attempt = await Attempt.create({ quiz: quiz._id, student: req.user._id, startedAt: now, status: 'in-progress' });
+        attempt = await Attempt.create({
+          quiz: quiz._id,
+          student: req.user._id,
+          startedAt: now,
+          status: 'in-progress',
+          currentQuestionIndex: 0,
+          itemStartedAt: now,
+          phaseStartedAt: now,
+        });
       } catch (err) {
         // Race condition: unique index caught a duplicate start
         if (err.code === 11000) {
@@ -83,12 +92,14 @@ const startAttempt = async (req, res, next) => {
       }
     }
 
-    const deadline = new Date(Math.min(quiz.endTime.getTime(), attempt.startedAt.getTime() + quiz.duration * 60000));
+    const { deadline, source } = resolveCurrentDeadline(quiz, attempt);
 
     res.json({
       attemptId: attempt._id,
       startedAt: attempt.startedAt,
+      currentQuestionIndex: attempt.currentQuestionIndex,
       deadline,
+      source, // 'QUESTION' | 'PHASE' | 'QUIZ' | 'NONE' — tells the UI which timer is active
       serverNow: now,
       quiz: {
         _id: quiz._id,
@@ -96,13 +107,82 @@ const startAttempt = async (req, res, next) => {
         subject: quiz.subject,
         stream: quiz.stream,
         duration: quiz.duration,
+        phases: quiz.phases,
         questions: quiz.questions.map((q) => ({
           questionText: q.questionText,
           options: q.options,
           marks: q.marks,
           negativeMarks: q.negativeMarks,
+          duration: q.duration,
+          phaseIndex: q.phaseIndex,
         })),
       },
+    });
+  } catch (err) {
+    next(err);
+  }
+};
+
+// POST /api/attempts/:id/advance  { selectedOption? }  (student)
+// Called when the current question's/phase's timer runs out, or when the
+// student manually taps Next. Saves the answer for the question being left
+// (if provided), moves the attempt forward by one question, and returns the
+// deadline for whatever is current now. This is the piece that didn't exist
+// before — it's what makes the timer per-question/per-phase instead of one
+// single countdown for the entire quiz.
+const advanceAttempt = async (req, res, next) => {
+  try {
+    const attempt = await Attempt.findById(req.params.id);
+    if (!attempt) return res.status(404).json({ message: 'Attempt not found' });
+    if (attempt.student.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ message: 'This attempt does not belong to you' });
+    }
+    if (attempt.status !== 'in-progress') {
+      return res.status(409).json({ message: 'This attempt is no longer in progress' });
+    }
+
+    const quiz = await Quiz.findById(attempt.quiz);
+    if (!quiz) return res.status(404).json({ message: 'Quiz not found' });
+
+    const now = new Date();
+
+    const { selectedOption } = req.body;
+    if (typeof selectedOption === 'number') {
+      const existing = attempt.answers.find((a) => a.questionIndex === attempt.currentQuestionIndex);
+      if (existing) existing.selectedOption = selectedOption;
+      else attempt.answers.push({ questionIndex: attempt.currentQuestionIndex, selectedOption });
+    }
+
+    // Outer hard stop: if the whole quiz's window has closed, finish now.
+    if (now >= quiz.endTime) {
+      await attempt.save();
+      return res.json({ finished: true, reason: 'QUIZ_ENDED' });
+    }
+
+    const nextIndex = attempt.currentQuestionIndex + 1;
+
+    if (nextIndex >= quiz.questions.length) {
+      await attempt.save();
+      return res.json({ finished: true, reason: 'LAST_QUESTION' });
+    }
+
+    const prevQuestion = quiz.questions[attempt.currentQuestionIndex];
+    const nextQuestion = quiz.questions[nextIndex];
+    const enteringNewPhase = (prevQuestion.phaseIndex ?? null) !== (nextQuestion.phaseIndex ?? null);
+
+    attempt.currentQuestionIndex = nextIndex;
+    attempt.itemStartedAt = now;
+    if (enteringNewPhase) attempt.phaseStartedAt = now;
+    await attempt.save();
+
+    const { deadline, source } = resolveCurrentDeadline(quiz, attempt);
+
+    res.json({
+      finished: false,
+      currentQuestionIndex: nextIndex,
+      deadline,
+      source,
+      serverNow: now,
     });
   } catch (err) {
     next(err);
@@ -128,10 +208,19 @@ const submitAttempt = async (req, res, next) => {
     const deadline = new Date(Math.min(quiz.endTime.getTime(), attempt.startedAt.getTime() + quiz.duration * 60000));
     const submittedAt = now.getTime() > deadline.getTime() + GRACE_MS ? deadline : now;
 
-    const { answers } = req.body;
-    const graded = gradeAnswers(quiz, answers);
+    // Merge any answers already saved via /advance with whatever the client sends now.
+    const incoming = req.body.answers || [];
+    const merged = {};
+    attempt.answers.forEach((a) => { merged[a.questionIndex] = a.selectedOption; });
+    incoming.forEach((a) => { merged[a.questionIndex] = a.selectedOption; });
+    const finalAnswers = Object.entries(merged).map(([questionIndex, selectedOption]) => ({
+      questionIndex: Number(questionIndex),
+      selectedOption,
+    }));
 
-    attempt.answers = (answers || []).map((a) => ({ questionIndex: a.questionIndex, selectedOption: a.selectedOption }));
+    const graded = gradeAnswers(quiz, finalAnswers);
+
+    attempt.answers = finalAnswers;
     attempt.status = 'submitted';
     attempt.submittedAt = submittedAt;
     attempt.timeTakenSeconds = Math.max(0, Math.round((submittedAt.getTime() - attempt.startedAt.getTime()) / 1000));
@@ -203,7 +292,6 @@ const getQuizAttempts = async (req, res, next) => {
 
     const attempts = await Attempt.find({ quiz: quiz._id, status: 'submitted' }).populate('student', 'name rollNumber stream');
 
-    // Rank by score descending (1 = best), independent of table display order
     const byScoreDesc = [...attempts].sort((a, b) => b.score - a.score);
     const rankMap = {};
     byScoreDesc.forEach((a, idx) => {
@@ -213,7 +301,6 @@ const getQuizAttempts = async (req, res, next) => {
     const classAverage =
       attempts.length > 0 ? Math.round((attempts.reduce((s, a) => s + a.percentage, 0) / attempts.length) * 100) / 100 : 0;
 
-    // Display sorted by percentage ascending (increasing order), as specified
     const rows = attempts
       .sort((a, b) => a.percentage - b.percentage)
       .map((a) => ({
@@ -237,4 +324,4 @@ const getQuizAttempts = async (req, res, next) => {
   }
 };
 
-module.exports = { startAttempt, submitAttempt, getMyResult, getQuizAttempts };
+module.exports = { startAttempt, advanceAttempt, submitAttempt, getMyResult, getQuizAttempts };
